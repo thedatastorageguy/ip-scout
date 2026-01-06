@@ -3,48 +3,153 @@
 HOSTS_FILE="/tmp/hosts_used.txt"
 OPEN_FILE="/tmp/open_ips.txt"
 line="----------------------------------------------------------------------------------"
-set -euo pipefail
+SUBNET=""
+MASK=""
+COUNT=1
+VERBOSE=0
+hostname=$(/bin/hostname|/bin/cut -d. -f1|/usr/bin/tr "[:upper:]" "[:lower:]")
+
+#set -euo pipefail
 
 usage() {
   cat <<EOF
 $line
-Usage: $0 -s SUBNET -m MASK [-n COUNT]
+Usage: $0 -n NETWORK -m MASK [-c COUNT] [-v]
 
-  -s SUBNET   Network address (e.g. 172.30.200.0). Must be a valid IPv4 and last octet = 0.
-  -m MASK     CIDR mask (/16–/30). Example: 16, 24, 30.
-  -n COUNT    Optional. Number of open IPs to list (default: 1).
+  -n NETWORK  Network address (e.g. 172.30.200.0)
+              (i.e. Must be a valid IPv4 and last octet must = 0)
 
-Outputs:
-  $HOSTS_FILE   - hostname, MAC, IP for all hosts found by nmap
-  $OPEN_FILE    - first COUNT unused IPs in the subnet (not seen by nmap)
+  -m MASK     Classless Interdomain Routing (CIDR) 'slash notation' mask 
+		/8  (Class A Default): 255.0.0.0 (255, 0, 0, 0)
+		/16 (Class B Default): 255.255.0.0 (255, 255, 0, 0)
+		/24 (Class C Default): 255.255.255.0 (255, 255, 255, 0)
+		/25: 255.255.255.128 (128 hosts)
+		/26: 255.255.255.192 (64 hosts)
+		/27: 255.255.255.224 (32 hosts)
+		/28: 255.255.255.240 (16 hosts)
+		/29: 255.255.255.248 (8 hosts)
+		/30: 255.255.255.252 (4 addresses, 2 usable hosts)
+
+  -c COUNT   [Optional] Number of open IPs to list (default: 1).
+
+  -v          Verbose
+
+Results:
+  $HOSTS_FILE     - hostname, MAC, IP for all hosts found by nmap
+  $OPEN_FILE       - first COUNT unused IPs in the subnet (not seen by nmap)
 $line
 EOF
   exit 1
 }
 
-SUBNET=""
-MASK=""
-COUNT=1
 
-while getopts ":s:m:n:h" opt; do
+log_msg() {
+
+	local arg="$1"
+	local opt="$2"
+    local notime=0
+	local nl=0
+	local cmd="echo"
+
+	if [ -z "$opt" ]; then
+		opt="[OK]"
+	elif [ $opt == "nr" ]; then
+		opt="[OK]"
+		cmd="printf"
+	elif [ $opt == "err" ]; then
+		opt="[ERROR]"
+	elif [ $opt == "err2" ]; then
+		opt="[ERROR]"
+		notime=1
+	elif [ $opt == "warn" ]; then
+		opt="[WARN]"
+	elif [ $opt == "verbose" ]; then
+		opt="[VERBOSE]"
+	fi
+
+	if [ $notime -eq 0 ]; then
+		$cmd  "[$(date '+%Y-%m-%d %H:%M:%S')] $hostname $opt $1" 
+	else
+		$cmd  "$hostname $opt $1" 
+	fi
+}
+
+spinner() {
+	PID=$1
+	if [ ! -z $PID ]; then
+		if [  $(ps -p $PID |grep -v TTY |wc -l) -gt  0 ]; then
+			i=1
+			sp="/-\|"
+			echo -n ' '
+			while  [ $(ps -p $PID |grep -v TTY |wc -l) -gt  0 ]; do
+					printf "\b${sp:i++%${#sp}:1}"
+					sleep 1
+			done
+		fi
+	fi
+}
+
+
+vlog_msg() {
+    if [ $VERBOSE -eq 1 ]; then
+		log_msg "$1" verbose $2
+	fi
+}
+
+is_number() {
+    n="$1"
+    if [ "$n" == 0 ]; then
+        echo "0"
+    elif ((n)) 2>/dev/null; then
+        n=$((n))
+        echo "0"
+    else
+        echo "1"
+    fi
+}
+start_timer() {
+  TIMER_START=$(date +%s)
+}
+
+stop_timer() {
+  TIMER_END=$(date +%s)
+  ELAPSED=$((TIMER_END - TIMER_START))
+}
+
+format_elapsed() {
+  local t=$1
+  printf "%02d:%02d:%02d" $((t/3600)) $(((t%3600)/60)) $((t%60))
+}
+
+# Main
+
+while getopts ":n:m:c:hv" opt; do
   case "$opt" in
-    s) SUBNET="$OPTARG" ;;
-    m) MASK="$OPTARG" ;;
-    n) COUNT="$OPTARG" ;;
+    v) VERBOSE=1;;
+    n) SUBNET="$OPTARG" ;;
+    m) MASK="$(echo $OPTARG|sed 's:/::g')" ;;
+    c)  if [ $(is_number "$OPTARG") -eq 0 ]; then
+		   COUNT="$OPTARG" 
+		else
+			log_msg "Count must be numeric" err2
+			exit 1
+		fi
+		;;
     h) usage ;;
-    *) echo "Unknown option: -$OPTARG" >&2; usage ;;
+    *) log_msg "Unknown option: -$OPTARG" err2
+		usage ;;
   esac
 done
 
 # --- Validate required args ---
 if [[ -z "$SUBNET" || -z "$MASK" ]]; then
-  echo "ERROR: -s SUBNET and -m MASK are required." >&2
+  log_msg "-n NETWORK and -m MASK are required." err2
   usage
 fi
 
 # --- Validate subnet is IPv4 and last octet = 0 ---
 if [[ ! "$SUBNET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-  echo "ERROR: Subnet must be a valid IPv4 address (e.g. 172.30.200.0)." >&2
+  log_msg "Subnet must be a valid IPv4 address (e.g. 172.30.200.0)." err
   exit 1
 fi
 
@@ -52,40 +157,45 @@ SCAN_TMP="$(mktemp)"
 USED_IPS="$(mktemp)"
 
 IFS='.' read -r o1 o2 o3 o4 <<< "$SUBNET"
-
+c=1
 for o in "$o1" "$o2" "$o3" "$o4"; do
   if (( o < 0 || o > 255 )); then
-    echo "ERROR: Subnet octet '$o' out of range (0–255)." >&2
+    log_msg "Subnet octet#$c = '$o' and is out of range (0–255)." err
     exit 1
+  else
+	vlog_msg "Subnet octet#$c = $o"
   fi
+  ((c++))
 done
 
 if (( o4 != 0 )); then
-  echo "ERROR: Last octet of subnet must be 0 (network address)." >&2
+  log_msg "Last octet [$o4] of subnet must be 0 (network address)."  err
   exit 1
+	
 fi
 
 # --- Validate mask ---
 if [[ ! "$MASK" =~ ^[0-9]{2}$ ]]; then
-  echo "ERROR: Mask must be a two-digit number (16–30)." >&2
+  log_msg "Mask [$MASK] must be a two-digit number (8-30)." err
   exit 1
 fi
-if (( MASK < 16 || MASK > 30 )); then
-  echo "ERROR: Mask must be between 16 and 30." >&2
+if (( MASK < 8 || MASK > 30 )); then
+  log_msg "Mask must be between 9 and 30."  err
   exit 1
 fi
 
 # --- Validate COUNT ---
 if [[ -n "${COUNT}" ]]; then
   if [[ ! "$COUNT" =~ ^[0-9]+$ ]] || (( COUNT < 1 )); then
-    echo "ERROR: -n COUNT must be a positive integer." >&2
+    log_msg "-n COUNT must be a positive integer." err
     exit 1
   fi
 fi
 
 # --- Check for nmap ---
 if ! command -v nmap >/dev/null 2>&1; then
-  echo "ERROR: nmap not found in PATH." >&2
+  log_msg "nmap not found in PATH. " err
+  log_msg "Please install nmap. (ex dnf -y install nmap)" err
   exit 1
 fi
 
@@ -107,10 +217,23 @@ int2ip() {
     $(( ip & 255 ))
 }
 
-echo "Scanning $SUBNET/$MASK with nmap..."
-nmap -sn --system-dns "$SUBNET/$MASK" > "$SCAN_TMP"
+start_timer
+vlog_msg "[COMMAND] nmap -sn --system-dns $SUBNET/$MASK"
 
-echo "Parsing nmap output into $HOSTS_FILE ..."
+if [ $VERBOSE -eq 0 ]; then
+	log_msg "Scanning $SUBNET/$MASK with nmap:  " nr
+	nmap -sn --system-dns "$SUBNET/$MASK" &> "$SCAN_TMP" 2>&1 & 
+	spinner $!
+    printf "\n"
+else
+	log_msg "Scanning $SUBNET/$MASK with nmap" 
+	nmap -sn --system-dns "$SUBNET/$MASK" 2>/dev/null |tee -a  "$SCAN_TMP"
+fi
+sleep 10
+stop_timer
+log_msg "nmap scan completed in $(format_elapsed  $ELAPSED) "
+
+log_msg "Parsing nmap output into $HOSTS_FILE ..."
 
 : > "$HOSTS_FILE"
 
@@ -153,8 +276,8 @@ awk -v out="$HOSTS_FILE" '
 USED_IPS="$(mktemp)"
 awk '{print $3}' "$HOSTS_FILE" | sort -u > "$USED_IPS"
 
-echo "Collected $(wc -l < "$HOSTS_FILE") used hosts into $HOSTS_FILE"
-echo "Finding first $COUNT open IP(s) in $SUBNET/$MASK ..."
+log_msg "Collected $(wc -l < "$HOSTS_FILE") used hosts into $HOSTS_FILE"
+log_msg "Finding first $COUNT open IP(s) in $SUBNET/$MASK ..."
 
 # Load used IPs into associative array for fast lookup
 declare -A USED
@@ -180,9 +303,9 @@ for (( ip_int = start_int; ip_int <= end_int && found < COUNT; ip_int++ )); do
 done
 
 if (( found == 0 )); then
-  echo "No open IPs found in $SUBNET/$MASK (based on nmap results)."
+  log_msg "No open IPs found in $SUBNET/$MASK (based on nmap results)." err
 else
-  echo "Saved $found open IP(s) to $OPEN_FILE"
+  log_msg "Saved $found open IP(s) to $OPEN_FILE"
 fi
 
 # Cleanup temp files
